@@ -3,6 +3,10 @@ from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy 
 from flask_migrate import Migrate
 
+from flask_jwt_extended import (JWTManager, create_access_token, create_refresh_token, jwt_required, get_jwt, get_jwt_identity)
+from werkzeug.security import check_password_hash, generate_password_hash
+from datetime import timedelta
+
 # Create the Flask application
 app = Flask(__name__)
 
@@ -13,9 +17,16 @@ CORS(app)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://root:@localhost/flaskapp_db'    # Tells SQLAlchemy how to connect to the MySQL db.
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False    # Disables Modification tracking.
 
+app.config['JWT_SECRET_KEY'] = 'your_jwt_secret_key'  # Change this to a secure secret key
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(minutes=15)  # Access token valid for 15 minutes
+app.config['JWT_REFRESH_TOKEN_EXPIRES'] = timedelta(days= 7)  # Refresh token expiration
+
+
 # Initialize SQLAlchemy
 db = SQLAlchemy(app)
 migrate = Migrate(app, db)
+
+jwt = JWTManager(app)  # Initialize JWT Manager
 
 
 # Create the Student model (table)
@@ -27,6 +38,13 @@ class Student(db.Model):    # Defines the student class
     gender = db.Column(db.String(10), nullable=False)
     age = db.Column(db.Integer, nullable=False)
     email = db.Column(db.String(100), nullable=False)  # Added email field
+    password_hash = db.Column(db.String(255), nullable=False)
+
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password):
+        return bool(self.password_hash) and check_password_hash(self.password_hash, password)
 
     # Convert object to dictionary
     def to_dict(self):
@@ -37,9 +55,19 @@ class Student(db.Model):    # Defines the student class
             "age": self.age,
             "email": self.email
         }
+    
 # Create the database tables
 # with app.app_context():
 #     db.create_all()
+
+# Create the TokenBlocklist model (table) for storing revoked tokens
+class TokenBlocklist(db.Model):
+    __tablename__ = "token_blocklist"
+
+    id = db.Column(db.Integer, primary_key=True)
+    jti = db.Column(db.String(36), nullable=False, unique=True)  # JWT ID
+    token_type = db.Column(db.String(20), nullable=False)
+
 
 # Create the Unit model (table)
 class Unit(db.Model):
@@ -62,6 +90,7 @@ class Unit(db.Model):
 class StudentUnit(db.Model):
     __tablename__ = "student_units"
 
+    id = db.Column(db.Integer, primary_key=True)
     studentID = db.Column(db.Integer, db.ForeignKey("students_x.studentID"), primary_key=True)
     unitID = db.Column(db.Integer, db.ForeignKey("units.unitID"), primary_key=True)
 
@@ -76,13 +105,17 @@ class StudentUnit(db.Model):
 def add_student():
     data = request.get_json()
 
+    if not data or not data.get("password"):
+        return jsonify({"error": "Password is required"}), 400
+
     new_student = Student(
         studentID = data["studentID"],
         name= data["name"],
         gender= data["gender"],
         age= data["age"],
-        email= data["email"]  # Added email field   
+        email= data["email"]  # Added email field
     )
+    new_student.set_password(data["password"])
 
     db.session.add(new_student)
     db.session.commit()
@@ -109,6 +142,23 @@ def get_student(studentID):
     return jsonify(student.to_dict())
 
 
+# AUTHENTICATE - Log in a student with email and password
+@app.route("/login", methods=["POST"])  
+def login():
+    data = request.get_json() or {}
+    email = data.get("email")
+    password = data.get("password")
+
+    if not email or not password:
+        return jsonify({"error": "Email and password are required"}), 400
+
+    student = Student.query.filter_by(email=email).first()
+    if not student or not student.check_password(password):
+        return jsonify({"error": "Invalid email or password"}), 401
+
+    return jsonify({"message": "Login successful", "student": student.to_dict()})
+
+
 # UPDATE - Update a student
 @app.route("/students/<int:studentID>", methods=["PUT"])
 def update_student(studentID):
@@ -124,6 +174,10 @@ def update_student(studentID):
     student.gender = data.get("gender", student.gender)
     student.age = data.get("age", student.age)
     student.email = data.get("email", student.email)  # Added email field
+    if "password" in data:
+        if not data["password"]:
+            return jsonify({"error": "Password cannot be empty"}), 400
+        student.set_password(data["password"])
     db.session.commit()
 
     return jsonify({"message": "Student updated successfully"})
@@ -326,6 +380,259 @@ def get_student_units_pivot():
         pivot_data.append(student_data)    # Add student data to pivot table
 
     return jsonify({"students": pivot_data, "units": [unit.to_dict() for unit in units]})
+
+
+# READ - Get student details by ID
+@app.route("/students/<int:studentID>/details", methods=["GET"])
+def get_student_details(studentID):
+    student = Student.query.get(studentID)
+
+    if not student:
+        return jsonify({"error": "Student not found"}), 404
+
+    enrollments = StudentUnit.query.filter_by(studentID=studentID).all()
+
+    units = []
+    for enrollment in enrollments:
+        unit = Unit.query.get(enrollment.unitID)
+        if unit:
+            units.append({
+                "unitID": unit.unitID,
+                "unitCode": unit.unitCode,
+                "unitName": unit.unitName
+            })
+
+    return jsonify({
+        "student": {
+            "studentID": student.studentID,
+            "name": student.name,
+            "gender": student.gender,
+            "age": student.age,
+            "email": student.email
+        },
+
+        "units": units
+    }), 200 
+
+
+# READ - Get unit details by ID
+@app.route("/units/<int:unitID>/details", methods=["GET"])
+def get_unit_details(unitID):
+    unit = Unit.query.get(unitID)
+
+    if not unit:
+        return jsonify({"error": "Unit not found"}), 404
+
+    enrollments = StudentUnit.query.filter_by(unitID=unitID).all()
+
+    students = []
+    for enrollment in enrollments:
+        student = Student.query.get(enrollment.studentID)
+        if student:
+            students.append({
+                "studentID": student.studentID,
+                "name": student.name,
+                "gender": student.gender,
+                "age": student.age, 
+                "email": student.email
+            })
+
+    return jsonify({
+        "unit": {
+            "unitID": unit.unitID,
+            "unitCode": unit.unitCode,
+            "unitName": unit.unitName
+        },
+        "students": students
+    }), 200
+
+
+# CREATE enrollment - Add a unit to a student
+@app.route("/enrollments", methods=["POST"])
+def enroll_student():
+
+    data = request.get_json()
+
+    studentID = data["studentID"]
+    unitID = data["unitID"]
+
+    if not studentID or not unitID:
+        return jsonify({"error": "Both studentID and unitID are required"}), 400
+
+    # Validate if the student exists
+    student = Student.query.get(studentID)
+
+    if not student:
+        return jsonify({"error": "Student not found"}), 404
+
+    # Validate if the unit exists
+    unit = Unit.query.get(unitID)
+
+    if not unit:
+        return jsonify({"error": "Unit not found"}), 404
+
+    # Check if the unit is already attached to the student
+    existing_enrollment = StudentUnit.query.filter_by(
+        studentID=studentID,
+        unitID=unitID,
+    ).first()
+
+    if existing_enrollment:
+        return jsonify({"error": "This unit has already been enrolled by the student"}), 400
+
+    # Relationship between the student and the unit
+    enrollment = StudentUnit(studentID=studentID, unitID=unitID)
+
+    db.session.add(enrollment)
+    db.session.commit()
+
+    return jsonify({"message": "Student successfully enrolled in unit"}), 201
+
+
+# GET enrollment - Get all enrollments
+@app.route("/enrollments", methods=["GET"])
+def get_enrollments():
+
+    enrollments = StudentUnit.query.all()
+    enrollment_list = []
+
+    for enrollment in enrollments:
+        student = Student.query.get(enrollment.studentID)
+        unit = Unit.query.get(enrollment.unitID)
+
+        if student and unit:
+            enrollment_list.append({
+                "ID": enrollment.id,
+                "studentID": student.studentID,
+                "studentName": student.name,
+                "unitID": unit.unitID,
+                "unitCode": unit.unitCode,
+                "unitName": unit.unitName
+            })
+        
+    return jsonify(enrollment_list), 200
+
+
+# POST - Student login to get access and refresh tokens
+@app.route("/auth/student/login", methods=["POST"])
+def student_login():    # Handles student login and returns access and refresh tokens
+
+    data = request.get_json()    # Get the JSON data from the request
+
+    email = data.get("email")    # Get the email from the JSON data
+    password = data.get("password")
+
+    if not email or not password:
+        return jsonify({"error": "Email and password are required"}), 400
+
+    student = Student.query.filter_by(email=email).first()    # Get the student from the database by email
+
+    if not student or not student.check_password(password):    # Checks whether the student does not exist or the password is incorrect
+        return jsonify({"error": "Invalid email or password"}), 401
+
+    # Create access and refresh tokens
+    access_token = create_access_token(identity=str(student.studentID))    # Create an access token with the student's ID as the identity
+    refresh_token = create_refresh_token(identity=str(student.studentID))
+
+    return jsonify({
+        "message": "Login successful",
+        "student": {
+            "studentID": student.studentID,
+            "name": student.name,
+            "gender": student.gender,
+            "age": student.age,
+            "email": student.email
+        },
+        "access_token": access_token,
+        "refresh_token": refresh_token   # Return the access and refresh tokens to the client
+    }), 200
+
+
+# GET - Access protected route for student profile using access token
+@app.route("/student/profile", methods=["GET"])    
+@jwt_required()    # Protects the endpoint
+def student_profile():   # D
+
+    current_student_id = get_jwt_identity()    # Get the current student's ID from the JWT identity
+    student = Student.query.get(current_student_id)    # Get the student from the database by ID
+
+    if not student:
+        return jsonify({"error": "Student not found"}), 404
+
+    return jsonify({
+        "studentID": student.studentID,
+        "name": student.name,
+        "gender": student.gender,
+        "age": student.age,
+        "email": student.email
+    }), 200
+
+
+# PUT - Update Student profile
+@app.route("/student/profile", methods=["PUT"])
+@jwt_required()    # Protects the endpoint
+def update_student_profile():    # Allows the student to update their profile information
+
+    current_student_id = get_jwt_identity()
+    student = Student.query.get(current_student_id)
+
+    if not student:
+        return jsonify({"error": "Student not found"}), 404
+
+    data = request.get_json()    # Get the JSON data from the request
+
+    student.name = data.get("name", student.name)
+    student.gender = data.get("gender", student.gender)
+    student.age = data.get("age", student.age)
+    student.email = data.get("email", student.email)
+
+    if "password" in data:
+        if not data["password"]:
+            return jsonify({"error": "Password cannot be empty"}), 400
+        student.set_password(data["password"])
+
+    db.session.commit()
+
+    return jsonify({"message": "Student profile updated successfully"}), 200
+
+
+# POST - Refresh access token using refresh token
+@app.route("/auth/student/refresh", methods=["POST"])
+@jwt_required(refresh=True)    # Protects the endpoint and requires a refresh token
+def refresh_access_token():
+
+    current_student_id = get_jwt_identity()
+    new_access_token = create_access_token(identity=str(current_student_id))    # Create a new access token with the student's ID as the identity
+
+    return jsonify({
+        "access_token": new_access_token
+    }), 200
+
+
+# Check if the token has been revoked 
+@jwt.token_in_blocklist_loader    # This decorator registers a callback function that will be called whenever a protected endpoint is accessed. The callback function checks if the token has been revoked by looking it up in the TokenBlocklist table.
+def check_if_token_revoked(jwt_header, jwt_payload):    # This function checks if the token has been revoked by looking it up in the TokenBlocklist table. If the token is found in the blocklist, it means that the token has been revoked and the user will not be able to access protected endpoints.
+
+    jti = jwt_payload["jti"]    # Get the JWT ID (jti) from the JWT payload
+    token = TokenBlocklist.query.filter_by(jti=jti).first()    # Query the TokenBlocklist table to check if the token has been revoked
+    return token is not None
+
+# POST - Logout student endpoint
+@app.route("/auth/student/logout", methods=["POST"])
+@jwt_required()    # Protects the endpoint      
+def student_logout():
+
+    jti = get_jwt()["jti"]    # Get the JWT ID (jti) from the JWT payload
+    token_type = get_jwt()["type"]   # Get the JWT ID (jti) and token type from the JWT payload
+
+    # Add the token to the blocklist
+    revoked_token = TokenBlocklist(jti=jti, token_type=token_type)    # Create a new TokenBlocklist object with the jti and token type
+    
+    db.session.add(revoked_token)    # Add the revoked token to the database session
+    db.session.commit()   # Commit the changes to the database
+
+    return jsonify({"message": "Student logged out successfully"}), 200
+
 
 
 # Run the application
